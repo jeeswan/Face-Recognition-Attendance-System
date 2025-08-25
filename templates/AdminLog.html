@@ -69,15 +69,15 @@
         {% if l >= 1 %}
         <table style="background-color: white; margin: 40px auto 20px auto;">
             <tr>
-                <td width="10%"><b>No.</b></td>
-                <td><b>User</b></td>
-                <td><b>Time of Login</b></td>
+                <td width="10%"><b>ID</b></td>
+                <td><b>Admin ID</b></td>
+                <td><b>Username</b></td>
             </tr>
             {% if l %} {% for i in range(l) %}
             <tr>
                 <td width="10%">{{ i+1 }}</td>
+                <td>{{ admin_ids[i] }}</td>
                 <td>{{ usernames[i] }}</td>
-                <td>{{ times[i] }}</td>
             </tr>
             {% endfor %} {% endif %}
         </table>

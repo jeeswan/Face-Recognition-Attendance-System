@@ -14,6 +14,8 @@ import tensorflow as tf
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from flask_mysqldb import MySQL
 import MySQLdb.cursors
+from werkzeug.security import generate_password_hash, check_password_hash
+import pickle
 
 load_dotenv()
 # Initializing the flask app
@@ -49,135 +51,205 @@ datetoday2 = date.today().strftime("%d %B %Y")
 
 # Capture the video
 face_detector = cv2.CascadeClassifier('static/haarcascade_frontalface_default.xml')
+eye_detector = cv2.CascadeClassifier('static/haarcascade_eye.xml')
 cap = cv2.VideoCapture(0)
 
 # ======= Check and Make Folders ========
-if not os.path.isdir('Attendance'):
-    os.makedirs('Attendance')
-if not os.path.isdir('UserList'):
-    os.makedirs('UserList')
-if not os.path.isdir('static/faces'):
-    os.makedirs('static/faces')
+folders = ['static/faces', 'final_model']
+for folder in folders:
+    os.makedirs(folder, exist_ok=True)
+    
+# ======= Global Variables =======
+cnn_model = None
+class_names = {}
         
 # ======= Total Registered Users ========
 def totalreg():
-    return len(os.listdir('static/faces'))
-
+    faces_dir = 'static/faces'
+    if not os.path.isdir(faces_dir):
+        return 0
+    return len([name for name in os.listdir(faces_dir) if os.path.isdir(os.path.join(faces_dir, name))])
 
 # ======= Get Face From Image =========
-def extract_faces(img):
-    if img is None:
-        return ()
-    gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    face_points = face_detector.detectMultiScale(gray_img, scaleFactor=1.5, minNeighbors=7)
-    return face_points
+def extract_faces_and_eyes(img):
+    if img is None or img.size == 0:
+        return (), ()
 
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-# Load the CNN model globally once
-cnn_model = load_model('static/face_recognition_model.h5')
+    # Detect faces
+    faces = face_detector.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+    eyes_list = []
 
-# Get class names (assuming each folder in 'static/faces' is a user/class)
-class_names = sorted([
-    d for d in os.listdir('static/faces')
-    if os.path.isdir(os.path.join('static/faces', d)) and not d.startswith('.')
-])
+    for (x, y, w, h) in faces:
+        roi_gray = gray[y:y+h, x:x+w]
+        eyes = eye_detector.detectMultiScale(roi_gray, scaleFactor=1.1, minNeighbors=3)
+        eyes_global = [(ex + x, ey + y, ew, eh) for (ex, ey, ew, eh) in eyes]
+        eyes_list.append(eyes_global)
 
-# ======= Identify Face Using ML ========
+    return faces, eyes_list
+
+# ======= Identify Face Using CNN Model ========
 def identify_face(face_img):
-    # face_img is expected to be a BGR image (from OpenCV)
-    if face_img is None:
-        return "No face detected"
-    # Resize to (224, 224) because your CNN expects this size
-    face_img = cv2.resize(face_img, (224, 224))
+    global cnn_model, class_names
     
-    # Convert BGR to RGB because Keras models usually expect RGB
-    face_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+    if face_img is None or cnn_model is None:
+        print("[DEBUG] No model or image available")
+        return "Unknown"
+
+    try:
+        # Preprocess face image
+        face_resized = cv2.resize(face_img, (224, 224))
+        face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
+        face_normalized = face_rgb.astype('float32') / 255.0
+        face_input = np.expand_dims(face_normalized, axis=0)
+
+        # Predict and get class with confidence
+        preds = cnn_model.predict(face_input, verbose=0)[0]
+        top1 = int(np.argmax(preds))
+        top2 = int(np.argsort(preds)[-2]) if preds.size >= 2 else top1
+        p1 = float(preds[top1])
+        p2 = float(preds[top2])
+
+        # Confidence floor and separation margin vs runner-up to avoid near-tie flips
+        CONFIDENCE_THRESHOLD = 0.7
+        MARGIN = 0.15
+
+        if p1 < CONFIDENCE_THRESHOLD or (p1 - p2) < MARGIN:
+            return "Unknown"
+
+        # Map to class name
+        return class_names.get(top1, "Unknown")
     
-    # Normalize pixels to [0,1]
-    face_img = face_img.astype('float32') / 255.0
-    
-    # Expand dims to shape (1, 224, 224, 3)
-    face_img = np.expand_dims(face_img, axis=0)
-    
-    # Predict class probabilities
-    preds = cnn_model.predict(face_img)
-    
-    # Get the index of highest probability
-    pred_index = np.argmax(preds)
-    
-     # Debug info
-    print("Predictions:", preds)
-    print("Predicted index:", pred_index)
-    print("Class names:", class_names)
-    
-    # Get the class name
-    # predicted_class = class_names[pred_index]
-    
-    # return predicted_class
-    if 0 <= pred_index < len(class_names):
-        return class_names[pred_index]
-    else:
+    except Exception as e:
+        print(f"[Error] Face identification failed: {e}")
         return "Unknown"
 
 # ======= Train Model Using Available Faces ========
 def train_model():
+    global cnn_model, class_names
+
     face_dir = 'static/faces'
-    if len(os.listdir(face_dir)) == 0:
+    model_path = 'final_model/face_recognition_model.h5'
+    class_path = 'final_model/class_names.pkl'
+
+    if not os.path.exists(face_dir) or len(os.listdir(face_dir)) == 0:
+        print("[Info] No faces to train on.")
         return
+        
+    # Remove old model if exists
+    if os.path.exists(model_path):
+        os.remove(model_path)
+    if os.path.exists(class_path):
+        os.remove(class_path)
 
-    # Remove old CNN model if exists
-    if 'face_recognition_model.h5' in os.listdir('static'):
-        os.remove('static/face_recognition_model.h5')
-
-    # Data generator for training
+    # Data augmentation
     datagen = ImageDataGenerator(
-        rescale=1/255.,
-        validation_split=0.2  # Split training and validation
+        rescale=1./255,
+        rotation_range=15,
+        width_shift_range=0.1,
+        height_shift_range=0.1,
+        shear_range=0.1,
+        zoom_range=0.1,
+        horizontal_flip=True,
+        brightness_range=[0.9, 1.1],
+        validation_split=0.2
     )
 
+    # Train and validation generators
     train_data = datagen.flow_from_directory(
-        face_dir,
-        target_size=(224, 224),
-        batch_size=32,
-        class_mode='categorical',
-        subset='training'
+        face_dir, target_size=(224,224), batch_size=32,
+        class_mode='categorical', subset='training', shuffle=True
     )
-
     val_data = datagen.flow_from_directory(
-        face_dir,
-        target_size=(224, 224),
-        batch_size=32,
-        class_mode='categorical',
-        subset='validation'
+        face_dir, target_size=(224,224), batch_size=32,
+        class_mode='categorical', subset='validation', shuffle=True
     )
-
-    # Simple CNN model
-    model = tf.keras.models.Sequential([
-        tf.keras.layers.Conv2D(10, kernel_size=3, activation="relu", input_shape=(224,224,3)),
-        tf.keras.layers.MaxPool2D(pool_size=2),
-        tf.keras.layers.Conv2D(10, kernel_size=2, activation="relu"),
-        tf.keras.layers.MaxPool2D(pool_size=2),
-        tf.keras.layers.Conv2D(10, kernel_size=2, activation="relu"),
-        tf.keras.layers.MaxPool2D(pool_size=2),
+    # Build CNN model
+    cnn_model = tf.keras.models.Sequential([
+        tf.keras.layers.Conv2D(32, (3,3), activation="relu", input_shape=(224,224,3)),
+        tf.keras.layers.MaxPooling2D(2,2),
+        tf.keras.layers.Conv2D(64, (3,3), activation="relu"),
+        tf.keras.layers.MaxPooling2D(2,2),
+        tf.keras.layers.Conv2D(128, (3,3), activation="relu"),
+        tf.keras.layers.MaxPooling2D(2,2),
         tf.keras.layers.Flatten(),
-        tf.keras.layers.Dense(128, activation='relu'),
-        tf.keras.layers.Dense(train_data.num_classes, activation='softmax')
+        tf.keras.layers.Dense(256, activation="relu"),
+        tf.keras.layers.Dropout(0.5),
+        tf.keras.layers.Dense(train_data.num_classes, activation="softmax")
     ])
 
-    model.compile(
+    cnn_model.compile(
         loss="categorical_crossentropy",
-        optimizer=tf.keras.optimizers.Adam(),
+        optimizer=tf.keras.optimizers.Adam(0.001),
         metrics=["accuracy"]
     )
 
-    model.fit(
-        train_data,
-        epochs=5,
-        validation_data=val_data
+    # Train the model
+    print("[INFO] Training model...")
+    cnn_model.fit(
+        train_data, steps_per_epoch=len(train_data),
+        validation_data=val_data, validation_steps=len(val_data),
+        epochs=20, verbose=1
     )
 
-    # Save the model
-    model.save('static/face_recognition_model.h5')
+    # Save model and class names
+    os.makedirs('final_model', exist_ok=True)
+    cnn_model.save(model_path)
+    
+    # Create class names mapping from training data
+    class_names = {v: k for k, v in train_data.class_indices.items()}
+    with open(class_path, 'wb') as f:
+        pickle.dump(class_names, f)
+
+    print("Model trained and saved successfully!")
+    print(f"Classes: {class_names}")
+    
+# ======= Load CNN Model =======
+def load_cnn_model():
+    global cnn_model, class_names
+
+    model_path = 'final_model/face_recognition_model.h5'
+    class_names_path = 'final_model/class_names.pkl'
+
+    # Load CNN model
+    if os.path.exists(model_path):
+        try:
+            cnn_model = load_model(model_path)
+        except Exception as e:
+            cnn_model = None
+    else:
+        print(f"[WARNING] CNN model not found at {model_path}.")
+        cnn_model = None
+
+    # Load class_names
+    if os.path.exists(class_names_path):
+        try:
+            with open(class_names_path, 'rb') as f:
+                class_names = pickle.load(f)
+        except Exception as e:
+            print(f"[ERROR] Failed to load class names: {e}")
+            class_names = {}
+    else:
+        print(f"[WARNING] class_names.pkl not found.")
+        class_names = {}
+
+    # Validate saved classes vs current face folders to avoid stale labels influencing predictions
+    try:
+        faces_root = 'static/faces'
+        if os.path.isdir(faces_root):
+            current_dirs = {d for d in os.listdir(faces_root) if os.path.isdir(os.path.join(faces_root, d))}
+            saved_labels = set(class_names.values()) if isinstance(class_names, dict) else set()
+            if saved_labels and not saved_labels.issubset(current_dirs):
+                print("[INFO] Detected class mismatch with current folders. Retraining model...")
+                train_model()
+                if os.path.exists(model_path):
+                    cnn_model = load_model(model_path)
+                if os.path.exists(class_names_path):
+                    with open(class_names_path, 'rb') as f:
+                        class_names = pickle.load(f)
+    except Exception as e:
+        print(f"[WARN] Class validation failed: {e}")
 
 # ======= Remove Attendance of Deleted User ======
 def remAttendance():
@@ -185,10 +257,10 @@ def remAttendance():
     cur = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
 
     # Collect valid IDs from both user tables
-    cur.execute("SELECT id FROM registered_user")
+    cur.execute("SELECT id FROM student WHERE status='registered'")
     registered_ids = {str(row['id']) for row in cur.fetchall()}
 
-    cur.execute("SELECT id FROM unregistered_user")
+    cur.execute("SELECT id FROM student WHERE status='unregistered'")
     unregistered_ids = {str(row['id']) for row in cur.fetchall()}
 
     valid_ids = registered_ids | unregistered_ids
@@ -205,17 +277,16 @@ def remAttendance():
 def extract_attendance():
     cur = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
 
+    datetoday_mysql = date.today().strftime("%Y-%m-%d")
+        
     query = """
         SELECT a.name, a.id, a.section, a.time,
-            CASE
-                WHEN a.id IN (SELECT id FROM unregistered_user) THEN 'Unregistered'
-                WHEN a.id IN (SELECT id FROM registered_user) THEN 'Registered'
-                ELSE 'Unknown'
-            END AS status
+               COALESCE(s.status, 'Unknown') AS status
         FROM attendance a
+        LEFT JOIN student s ON a.id = s.id
         WHERE DATE(a.time) = %s
+        ORDER BY a.time ASC
     """
-    datetoday_mysql = date.today().strftime("%Y-%m-%d")
     cur.execute(query, (datetoday_mysql,))
     rows = cur.fetchall()
     cur.close()
@@ -284,12 +355,25 @@ def take_attendance():
     
 @app.route('/attendancebtn', methods=['GET'])
 def attendancebtn():
+    global cnn_model, class_names
+    
     if len(os.listdir('static/faces')) == 0:
         return render_template('Attendance.html', datetoday2=datetoday2,
                                mess='Database is empty! Register yourself first.')
 
-    if 'face_recognition_model.h5' not in os.listdir('static'):
+    # Ensure model exists and is loaded
+    if cnn_model is None:
+        print("[INFO] Model not loaded, attempting to load...")
+        load_cnn_model()
+        
+    if cnn_model is None:
+        print("[INFO] No model found, training new model...")
         train_model()
+        load_cnn_model()
+
+    if cnn_model is None:
+        return render_template('Attendance.html', datetoday2=datetoday2,
+                               mess='Failed to load or train model.')
 
     cap = cv2.VideoCapture(0)
     if cap is None or not cap.isOpened():
@@ -298,56 +382,68 @@ def attendancebtn():
                                totalreg=totalreg(), datetoday2=datetoday2, mess='Camera not available.')
 
     ret = True
-    j = 1
-    flag = None
+    # temporal smoothing & lock-on
+    consecutive_counts = {}
+    current_lock = None
+    lock_grace = 10  # frames to keep lock if momentarily lost
+    lock_timer = 0
+    NEED_CONSEC = 5   # frames required to confirm identity
 
     while ret:
         ret, frame = cap.read()
-        faces = extract_faces(frame)  # Detect all faces
+        faces, eyes_list = extract_faces_and_eyes(frame)
 
         identified_person_name = "Unknown"
         identified_person_id = "N/A"
 
         if faces is not None and len(faces) > 0:
-            (x, y, w, h) = faces[0]  # Use first detected face
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 20), 2)
+            for i, (x, y, w, h) in enumerate(faces):
+                if w < 100 or h < 100:  # Skip very small faces
+                    continue
+                    
+                if i < len(eyes_list) and len(eyes_list[i]) > 0:
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 20), 2)
+                    for (ex, ey, ew, eh) in eyes_list[i]:
+                        cv2.rectangle(frame, (ex, ey), (ex + ew, ey + eh), (0, 255, 0), 2)
 
-            # Resize and prepare the face
-            face_img = cv2.resize(frame[y:y + h, x:x + w], (224, 224))
+                    face_img = cv2.resize(frame[y:y + h, x:x + w], (224, 224))
+                    identified_person = identify_face(face_img)
 
-            identified_person = identify_face(face_img)
+                    # If we already locked an identity, keep it as long as lock_timer remains
+                    if current_lock is not None and '$' in current_lock:
+                        identified_person_name, identified_person_id, *_ = current_lock.split('$')
+                        lock_timer = lock_grace
+                    else:
+                        # Build up consecutive evidence before locking and marking attendance
+                        if identified_person is not None and '$' in identified_person:
+                            consecutive_counts[identified_person] = consecutive_counts.get(identified_person, 0) + 1
+                            if consecutive_counts[identified_person] >= NEED_CONSEC:
+                                current_lock = identified_person
+                                consecutive_counts.clear()
+                                add_attendance(current_lock)
+                                identified_person_name, identified_person_id, *_ = current_lock.split('$')
+                        else:
+                            consecutive_counts.clear()
 
-            if identified_person is not None and '$' in identified_person:
-                identified_person_name, identified_person_id, *_ = identified_person.split('$')
+                    cv2.putText(frame, f'Name: {identified_person_name}', (30, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 20), 2, cv2.LINE_AA)
+                    cv2.putText(frame, f'ID: {identified_person_id}', (30, 60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 20), 2, cv2.LINE_AA)
+                    cv2.putText(frame, 'Press Esc to close', (30, 90),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 127, 255), 2, cv2.LINE_AA)
 
-                if flag != identified_person:
-                    j = 1
-                    flag = identified_person
-
-                if j % 20 == 0:
-                    add_attendance(identified_person)
-            else:
-                identified_person = "Unknown"
-
-            cv2.putText(frame, f'Name: {identified_person_name}', (30, 30), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                        (255, 0, 20), 2, cv2.LINE_AA)
-            cv2.putText(frame, f'ID: {identified_person_id}', (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                        (255, 0, 20), 2, cv2.LINE_AA)
-            cv2.putText(frame, 'Press Esc to close', (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                        (0, 127, 255), 2, cv2.LINE_AA)
-
-            j += 1
         else:
-            j = 1
-            flag = None
+            # if no faces, decay the lock
+            if current_lock is not None:
+                lock_timer -= 1
+                if lock_timer <= 0:
+                    current_lock = None
 
-        # Display the frame
-        cv2.namedWindow('Attendance', cv2.WINDOW_NORMAL)
-        cv2.resizeWindow('Attendance', 800, 600)
-        cv2.setWindowProperty('Attendance', cv2.WND_PROP_TOPMOST, 1)
+        cv2.namedWindow('Attendance', cv2.WND_PROP_FULLSCREEN)
+        cv2.setWindowProperty('Attendance', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
         cv2.imshow('Attendance', frame)
 
-        if cv2.waitKey(1) == 27:  # ESC key to exit
+        if cv2.waitKey(1) == 27:
             break
 
     cap.release()
@@ -379,7 +475,7 @@ def adduserbtn():
 
     # Check if user already exists in DB
     cur = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-    cur.execute("SELECT * FROM unregistered_user WHERE id = %s", (newuserid,))
+    cur.execute("SELECT * FROM student WHERE id = %s", (newuserid,))
     existing_user = cur.fetchone()
     if existing_user:
         cap.release()
@@ -387,58 +483,59 @@ def adduserbtn():
         return render_template('AddUser.html', mess='User already exists in database.')
 
     images_captured = 0
-    frame_count = 0
-    max_frames = 1000
+    max_images = 100
 
-    while images_captured < 50 and frame_count < max_frames:
+    while images_captured < max_images:
         ret, frame = cap.read()
         if not ret:
             break
 
-        faces = extract_faces(frame)
-        if faces is None or len(faces) == 0:
-            cv2.putText(frame, 'No face detected. Please face the camera.', (30, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-        else:
-            for (x, y, w, h) in faces:
-                cv2.putText(frame, f'Images Captured: {images_captured}/50', (30, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 20), 2)
-                if frame_count % 10 == 0:
-                    img_name = f'{newusername}_{images_captured}.jpg'
-                    cv2.imwrite(os.path.join(userimagefolder, img_name), frame[y:y + h, x:x + w])
+        faces, eyes_list = extract_faces_and_eyes(frame)
+        if faces is not None:
+            for i, (x, y, w, h) in enumerate(faces):
+                if i < len(eyes_list) and len(eyes_list[i]) > 0:
+                    face_img = cv2.resize(frame[y:y+h, x:x+w], (224,224))
+                    cv2.imwrite(
+                        os.path.join(userimagefolder, f'{images_captured}.jpg'),
+                        face_img
+                    )
                     images_captured += 1
 
-        cv2.namedWindow('Collecting Face Data', cv2.WINDOW_NORMAL)
-        cv2.setWindowProperty('Collecting Face Data', cv2.WND_PROP_TOPMOST, 1)
-        cv2.imshow('Collecting Face Data', frame)
+                    cv2.rectangle(frame, (x,y), (x+w, y+h), (255,0,20), 2)
+                    for (ex, ey, ew, eh) in eyes_list[i]:
+                        cv2.rectangle(frame, (ex,ey), (ex+ew, ey+eh), (0,255,0), 2)
 
-        if cv2.waitKey(1) == 27:  # ESC to exit
+        cv2.putText(frame, f'Images Captured: {images_captured}/{max_images}', (30,60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,20), 2)
+        cv2.namedWindow("Collecting Face Data", cv2.WND_PROP_FULLSCREEN)
+        cv2.setWindowProperty("Collecting Face Data", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        cv2.imshow("Collecting Face Data", frame)
+        if cv2.waitKey(1) == 27:
             break
-
-        frame_count += 1
 
     cap.release()
     cv2.destroyAllWindows()
 
     if images_captured == 0:
         shutil.rmtree(userimagefolder)
-        return render_template('AddUser.html', mess='Failed to capture photos.')
+        return render_template('AddUser.html', mess='Failed to capture valid face images.')
 
     # Insert new user into MySQL
     cur = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
     cur.execute("""
-        INSERT INTO unregistered_user (name, id, section)
-        VALUES (%s, %s, %s)
+        INSERT INTO student (name, id, section, status)
+        VALUES (%s, %s, %s, 'unregistered')
     """, (newusername, newuserid, newusersection))
     mysql.connection.commit()
     cur.close()
 
-    # Retrain model after adding user
+    # Retrain model immediately with new user
     train_model()
+    load_cnn_model()  # Reload the model after training
 
-    # Fetch updated unregistered user list
+    # Fetch updated unregistered students
     cur = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-    cur.execute("SELECT name, id, section FROM unregistered_user")
+    cur.execute("SELECT * FROM student WHERE status='unregistered' ORDER BY id ASC")
     rows = cur.fetchall()
     cur.close()
 
@@ -471,13 +568,11 @@ def attendancelistdate():
     cur = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
     cur.execute("""
         SELECT a.name, a.id, a.section, a.time,
-            CASE
-                WHEN a.id IN (SELECT id FROM unregistered_user) THEN 'Unregistered'
-                WHEN a.id IN (SELECT id FROM registered_user) THEN 'Registered'
-                ELSE 'Unknown'
-            END AS status
+               COALESCE(s.status, 'Unknown') AS status
         FROM attendance a
+        LEFT JOIN student s ON a.id = s.id
         WHERE DATE(a.time) = %s
+        ORDER BY a.time ASC
     """, (date_selected,))
     rows = cur.fetchall()
     cur.close()
@@ -538,49 +633,47 @@ def unregisteruser():
     if not g.user:
         return render_template('LogInForm.html')
 
-    # remove_empty_cells()
     try:
         idx = int(request.form['index'])
     except (ValueError, KeyError):
         return "Invalid index (not a number or missing)", 400
 
-     # Get the user to unregister from DB
-    cur = mysql.connection.cursor()
-    cur.execute("SELECT id, name, user_id, section FROM registered_users ORDER BY id ASC")
+    cur = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
+    # Get only registered students
+    cur.execute("SELECT * FROM student WHERE status='registered' ORDER BY id ASC")
     registered = cur.fetchall()
+
     if idx < 0 or idx >= len(registered):
         return "Invalid index", 400
 
-    user = registered[idx]  # tuple: (id, name, user_id, section)
+    user = registered[idx]
+    userid, username, section = user['id'], user['name'], user['section']
 
-    # Move the face folder
-    old_folder = f"static/faces/{user[1]}${user[2]}${user[3]}"
-    new_folder = f"static/faces/{user[1]}${user[2]}$None"
+        # Move the face folder (optional)
+    old_folder = f"static/faces/{username}${userid}${section}"
+    new_folder = f"static/faces/{username}${userid}$None"
     if os.path.exists(old_folder):
         if os.path.exists(new_folder):
             shutil.rmtree(new_folder)
         shutil.move(old_folder, new_folder)
-
-    # Insert into unregistered_users
+        
+    # Update status in single student table
     cur.execute(
-        "INSERT INTO unregistered_users (name, user_id, section) VALUES (%s, %s, %s)",
-        (user[1], user[2], 'None')
+        "UPDATE student SET status='unregistered', section=NULL WHERE id=%s",
+        (userid,)
     )
-
-    # Delete from registered_users
-    cur.execute("DELETE FROM registered_users WHERE id=%s", (user[0],))
     mysql.connection.commit()
     cur.close()
 
-    # Return updated list
+    # Return updated list of registered students
     cur = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-    cur.execute("SELECT name, user_id, section FROM registered_users ORDER BY id ASC")
+    cur.execute("SELECT * FROM student WHERE status='registered' ORDER BY id ASC")
     rows = cur.fetchall()
     cur.close()
 
-    names = [r[0] for r in rows]
-    rolls = [r[1] for r in rows]
-    sec = [r[2] for r in rows]
+    names = [r['name'] for r in rows]
+    rolls = [r['id'] for r in rows]
+    sec = [r['section'] for r in rows]
     l = len(rows)
 
     mess = f'Number of Registered Students: {l}' if l > 0 else "Database is empty!"
@@ -594,7 +687,7 @@ def unregister_user_list():
         return render_template('LogInForm.html')
     
     cur = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-    cur.execute("SELECT name, id, section FROM unregistered_user ORDER BY id ASC")
+    cur.execute("SELECT * FROM student WHERE status='unregistered' ORDER BY id ASC")
     rows = cur.fetchall()
     cur.close()
 
@@ -618,7 +711,8 @@ def deleteunregistereduser():
     idx = int(request.form['index'])
 
     cur = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-    cur.execute("SELECT * FROM unregistered_user ORDER BY id ASC")
+    # Fetch unregistered students only
+    cur.execute("SELECT * FROM student WHERE status='unregistered' ORDER BY id ASC")
     unregistered = cur.fetchall()
 
     if idx >= len(unregistered):
@@ -632,7 +726,8 @@ def deleteunregistereduser():
         shutil.rmtree(folder)
         train_model()
 
-    cur.execute("DELETE FROM unregistered_user WHERE id = %s", (userid,))
+    # Delete student from table
+    cur.execute("DELETE FROM student WHERE id = %s AND status='unregistered'", (userid,))
     mysql.connection.commit()
     cur.close()
 
@@ -645,8 +740,8 @@ def register_user_list():
         return render_template('LogInForm.html')
 
     cur = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-    
-    cur.execute("SELECT name, id, section FROM registered_user ORDER BY id ASC")
+
+    cur.execute("SELECT * FROM student WHERE status='registered' ORDER BY id ASC")
     rows = cur.fetchall()
     cur.close()
 
@@ -671,44 +766,40 @@ def registeruser():
         return "Invalid input", 400
 
     cur = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-    cur.execute("SELECT * FROM unregistered_user ORDER BY id ASC")
+    # Get all unregistered students
+    cur.execute("SELECT * FROM student WHERE status='unregistered' ORDER BY id ASC")
     unregistered = cur.fetchall()
 
     if idx < 0 or idx >= len(unregistered):
         return "Invalid user index", 400
 
     user = unregistered[idx]
-    name, user_id = user['name'], user['id']
+    name, userid = user['name'], user['id']
 
     # Move the face folder
-    old_folder = f"static/faces/{name}${user_id}$None"
-    new_folder = f"static/faces/{name}${user_id}${section}"
+    old_folder = f"static/faces/{name}${userid}$None"
+    new_folder = f"static/faces/{name}${userid}${section}"
     if os.path.exists(old_folder):
         if os.path.exists(new_folder):
             shutil.rmtree(new_folder)
         shutil.move(old_folder, new_folder)
 
-    # Insert into registered_user
+    # Update status and section in single student table
     cur.execute(
-        "INSERT INTO registered_user (name, id, section) VALUES (%s, %s, %s)",
-        (name, user_id, section)
+        "UPDATE student SET status='registered', section=%s WHERE id=%s",
+        (section, userid)
     )
-
-    # Delete from unregistered_user
-    cur.execute("DELETE FROM unregistered_user WHERE id=%s", (user_id,))
-
-    # Commit both operations to save changes permanently
     mysql.connection.commit()
     cur.close()
 
     # Reload unregistered list
     cur = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-    cur.execute("SELECT name, id, section FROM unregistered_user ORDER BY id ASC")
+    cur.execute("SELECT * FROM student WHERE status='unregistered' ORDER BY id ASC")
     rows = cur.fetchall()
     cur.close()
 
     names = [r['name'] for r in rows]
-    rolls = [r['id'] for r in rows]
+    rolls = [r['user_id'] for r in rows]  # or r['id'] if you prefer DB ID
     secs = [r['section'] for r in rows]
     l = len(rows)
 
@@ -724,7 +815,7 @@ def deleteregistereduser():
     idx = int(request.form['index'])
 
     cur = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
-    cur.execute("SELECT * FROM registered_user ORDER BY id ASC")
+    cur.execute("SELECT * FROM student WHERE status='registered' ORDER BY id ASC")
     registered = cur.fetchall()
 
     if idx >= len(registered):
@@ -740,13 +831,14 @@ def deleteregistereduser():
         train_model()
 
     # Delete from DB
-    cur.execute("DELETE FROM registered_user WHERE id = %s", (userid,))
+    cur.execute("DELETE FROM student WHERE id = %s and status='registered'", (userid,))
     mysql.connection.commit()
     cur.close()
 
     # Refresh list
     return redirect(url_for('register_user_list'))
 
+# ======== Flask Login =========
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if g.user:
@@ -754,42 +846,99 @@ def login():
         return redirect(url_for('home', admin=False))
 
     if request.method == 'POST':
-        if request.form['username'] == 'admin' and request.form['password'] == '12345':
-            session['admin'] = request.form['username']
-            
-            # Record login time in MySQL
-            cur = mysql.connection.cursor()
-            cur.execute("INSERT INTO admin (username) VALUES (%s)", (session['admin'],))
-            mysql.connection.commit()
+        admin_id = request.form['admin_id']
+        password = request.form['password']
+
+        cur = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
+
+        # Step 1: Fetch user
+        cur.execute("SELECT * FROM admin_signup WHERE admin_id = %s", (admin_id,))
+        user = cur.fetchone()
+
+        if user and check_password_hash(user['password'], password):
+            # Step 2: Insert login record (store login time, not password!)
+            try:
+                cur.execute("INSERT INTO admin_login (admin_id, username) VALUES (%s, %s)",
+                            (admin_id, user['username']))
+                mysql.connection.commit()
+                print("Stored login record for:", admin_id)
+            except Exception as e:
+                mysql.connection.rollback()
+                print("!!!Error inserting login record:", e)
+
+            # Step 3: Save session
+            session['admin'] = admin_id
             cur.close()
-            
-            
-            return redirect(url_for('home', admin=True, mess='Logged in as Administrator'))
+            return redirect(url_for('home', admin=True, mess=f'Logged in as {admin_id}'))
         else:
-            return render_template('LogInForm.html', mess='Incorrect Username or Password')
+            cur.close()
+            return render_template('LogInForm.html', mess='Incorrect Admin ID or Password')
+
     return render_template('LogInForm.html')
 
 # ======== Flask Logout =========
 @app.route('/logout')
 def logout():
     session.pop('admin', None)
-    return render_template('LogInFrom.html')
+    return render_template('LogInForm.html')
 
-# ======== Admin Log =========
+# ======== Flask Sign Up =========
+@app.route('/signup', methods=['GET', 'POST'])
+def signup():
+    
+    if request.method == 'POST':
+        admin_id = request.form['admin_id']
+        username = request.form['username']
+        password = request.form['password']
+        hashed_password = generate_password_hash(password)
+
+        cur = mysql.connection.cursor()
+        cur.execute("SELECT * FROM admin_signup WHERE admin_id = %s", (admin_id,))
+        existing_user = cur.fetchone()
+
+        # Check if user already exists
+        if existing_user:
+            mess = "Admin ID already exists!"
+            return render_template('SignUpPage.html', mess=mess)
+
+        try:
+            # Insert new user
+            cur.execute("INSERT INTO admin_signup (admin_id, username, password) VALUES (%s, %s, %s)",
+                        (admin_id, username, hashed_password))
+            mysql.connection.commit()
+            mess = "Account created successfully! Please log in."
+            return redirect(url_for('login', mess=mess))
+        except Exception as e:
+            mysql.connection.rollback()
+            mess = f"Database error: {str(e)}"
+            return render_template('SignUpPage.html', mess=mess)
+        finally:
+            cur.close()
+
+    return render_template('SignUpPage.html')
+
 @app.route('/adminlog')
 def adminlog():
-    if not g.user:
-        return render_template('LogInForm.html')
+    # Ensure admin is logged in
+    if 'admin' not in session:
+        return render_template('LogInForm.html', mess="Please log in first.")
 
-    cur = mysql.connection.cursor()
-    cur.execute("SELECT username, time FROM admin ORDER BY time DESC")
+    cur = mysql.connection.cursor(MySQLdb.cursors.DictCursor)
+    
+    # Fetch all admin users from signup table
+    cur.execute("""
+        SELECT l.admin_id, s.username 
+        FROM admin_login l
+        JOIN admin_signup s ON l.admin_id = s.admin_id
+        ORDER BY l.admin_id DESC
+    """)
     logs = cur.fetchall()
     cur.close()
-    
-    usernames = [log[0] for log in logs]
-    times = [log[1] for log in logs]
 
-    return render_template('AdminLog.html', usernames=usernames, times=times, l=len(logs))
+    admin_ids = [log['admin_id'] for log in logs]
+    usernames = [log['username'] for log in logs]
+
+    return render_template('AdminLog.html', admin_ids=admin_ids, usernames=usernames, l=len(logs))
 
 # Main Function
 if __name__ == '__main__':
