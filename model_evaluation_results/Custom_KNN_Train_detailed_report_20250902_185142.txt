@@ -1,0 +1,49 @@
+MODEL EVALUATION REPORT
+========================
+
+Model: Custom_KNN_Train
+Date: 2025-09-02 18:51:42
+Total Samples: 720
+
+PERFORMANCE METRICS
+------------------
+Accuracy: 0.9958 (99.58%)
+Precision: 0.9959
+Recall: 0.9958
+F1-Score: 0.9958
+
+PREDICTIONS
+-----------
+Correct: 717
+Incorrect: 3
+Success Rate: 99.58%
+
+CONFUSION MATRIX
+----------------
+[[80  0  0  0  0  0  0  0  0]
+ [ 0 80  0  0  0  0  0  0  0]
+ [ 0  0 80  0  0  0  0  0  0]
+ [ 1  1  0 77  1  0  0  0  0]
+ [ 0  0  0  0 80  0  0  0  0]
+ [ 0  0  0  0  0 80  0  0  0]
+ [ 0  0  0  0  0  0 80  0  0]
+ [ 0  0  0  0  0  0  0 80  0]
+ [ 0  0  0  0  0  0  0  0 80]]
+
+CLASSIFICATION REPORT
+--------------------
+                          precision    recall  f1-score   support
+
+          Bibek$220810$A       0.99      1.00      0.99        80
+           Deepak$2208$A       0.99      1.00      0.99        80
+Dharma Harsha$22081001$A       1.00      1.00      1.00        80
+      Jeeswan$22081033$A       1.00      0.96      0.98        80
+       Krisha$22081024$A       0.99      1.00      0.99        80
+      Roshani$22081000$A       1.00      1.00      1.00        80
+       Shreejan$191861$A       1.00      1.00      1.00        80
+           samikhya$01$A       1.00      1.00      1.00        80
+       suyesh$22081045$A       1.00      1.00      1.00        80
+
+                accuracy                           1.00       720
+               macro avg       1.00      1.00      1.00       720
+            weighted avg       1.00      1.00      1.00       720
