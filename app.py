@@ -1094,4 +1094,4 @@ if __name__ == '__main__':
     print("=" * 60)
     
     # KNN model is trained on-demand when needed
-    app.run(port=5001, debug=True)
+    app.run(host='0.0.0.0', debug=True)
